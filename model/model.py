@@ -1,6 +1,4 @@
 from transformers import PretrainedConfig
-from typing import Optional, Tuple
-import torch.nn.functional as F
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "MiniMind"
@@ -75,6 +73,9 @@ class MiniMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
+from transformers.activations import ACT2FN
+from typing import Optional, Tuple
+import torch.nn.functional as F
 
 # inherit nn.Module
 class RMSNorm(nn.Module):
@@ -299,11 +300,30 @@ class Attention(nn.Module):
         return output, past_kv
 
 
+class FeedForward(nn.Module):
+    # 初始化
+    def __init__(self, args:MiniMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size*8/3)
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+        # 升维
+        # up_proj: hidden -> intermediate (用于被gate的部分)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
 
+        # SwiGLU类似于Gated Linear Unit变体：act(gate(x)) * up(x)
 
+        # 降维
+        # down_proj: intermediate -> hidden (用于投影回hidden维度)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        # 门控
+        # gate_proj: hidden -> intermediate (用于计算gate部分)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        # dropout
+        self.dropout = nn.Dropout(args.dropout)
+        # 激活函数
+        self.act_fn = ACT2FN[args.hidden_act]
 
-
-
-
-
-
+    def forward(self, x):
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
