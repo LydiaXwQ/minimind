@@ -361,3 +361,78 @@ class MinimindBlock(nn.Module):
         # FFN子层：输入先归一化（RMSNorm），返回hidden_states
         hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))  # 输入先做LayerNorm
         return hidden_states, present_key_value
+
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MinimindBlock(i, config) for i in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # RoPE预计算
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_base,
+            rope_scaling = config.rope_scaling
+        )
+
+        # 将预计算的频率注册为buffer，这样它们就会随着模型一起移动到GPU/TPU，并且不会被优化器更新
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        
+    def forward(self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs):
+
+        batch_size, seq_len = input_ids.shape
+
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+        
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        # past_key_values[0] 形如 (k, v)，k.shape = [bsz, past_seq_len, n_kv_heads, head_dim]
+        start_pos = (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+
+        # Embedding + dropout
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        # 从注册的buffer中取出对应位置范围的cos/sin作为position_embeddings
+        # self.freqs_cos/freqs_sin的shape为 [max_pos, head_dim]
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos + seq_length],
+            self.freqs_sin[start_pos:start_pos + seq_length]
+        )
+
+        # 逐层前向，通过zip把layer和对应的past_key_value配对
+        presents = []
+        for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+
+        # 最后做归一化
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states, presents
+
+
+
+
+
+
