@@ -74,10 +74,11 @@ import torch
 import torch.nn as nn
 import math
 from transformers.activations import ACT2FN
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, List
 import torch.nn.functional as F
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import PreTrainedModel, GenerationMixin
 
-# inherit nn.Module
 class RMSNorm(nn.Module):
 
 # Initialization method
@@ -376,7 +377,7 @@ class MiniMindModel(nn.Module):
         freqs_cos, freqs_sin = precompute_freqs_cis(
             dim = config.hidden_size // config.num_attention_heads,
             end = config.max_position_embeddings,
-            rope_base = config.rope_base,
+            rope_base = config.rope_theta,
             rope_scaling = config.rope_scaling
         )
 
@@ -410,8 +411,8 @@ class MiniMindModel(nn.Module):
         # 从注册的buffer中取出对应位置范围的cos/sin作为position_embeddings
         # self.freqs_cos/freqs_sin的shape为 [max_pos, head_dim]
         position_embeddings = (
-            self.freqs_cos[start_pos:start_pos + seq_length],
-            self.freqs_sin[start_pos:start_pos + seq_length]
+            self.freqs_cos[start_pos:start_pos + seq_len],
+            self.freqs_sin[start_pos:start_pos + seq_len]
         )
 
         # 逐层前向，通过zip把layer和对应的past_key_value配对
@@ -431,8 +432,58 @@ class MiniMindModel(nn.Module):
 
         return hidden_states, presents
 
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+    def __init__(self, config: MiniMindConfig):
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # 权重共享
+        # 输出层的权重和潜入层的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+    
+    def forward(self,
+    input_ids: Optional[torch.Tensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    labels: Optional[torch.Tensor] = None,
+    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+    use_cache: bool = False,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+    **args,):
+    
+        hidden_states, presents = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+
+        # logits to keep 是整数，保留最后n个位置：
+        # 生成的时候只需要最后的logits来预测下一个token
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance(logits_to_keep, int)
+            else logits_to_keep
+        )
+
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
 
 
-
-
-
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=presents,
+            hidden_states=hidden_states
+        )
