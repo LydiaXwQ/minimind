@@ -78,6 +78,7 @@ from typing import Optional, Tuple, Union, List
 import torch.nn.functional as F
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import PreTrainedModel, GenerationMixin
+from torch.nn import init
 
 class RMSNorm(nn.Module):
 
@@ -487,3 +488,128 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             past_key_values=presents,
             hidden_states=hidden_states
         )
+
+class MoEGate(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim) # shape = (bsz*seq_len, hidden_dim)
+        # 计算出每个token对各个expert的logits
+        logits = F.linear(hidden_states, self.weight, None)
+
+        # Sb,e: 每个token对每个专家的分数，shape = (bsz*seq_len, n_routed_experts)
+        if self.scoring_func == "softmax":
+            scores = F.softmax(logits, dim=-1)
+        else:
+            raise NotImplementedError(f"Scoring function {self.scoring_func} not implemented")
+    
+        # 两种aux loss计算方式：
+        # 序列级别
+        # Batch级别
+        topk_weight, topk_idx = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_prob:
+            # 对每个token的topk权重求和
+            denominator = (
+                topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            )
+            # 每个token的topk权重除以这个和，得到归一化的权重
+            topk_weight = topk_weight / denominator
+
+        # 计算辅助损失（仅训练时）
+        # 辅助损失的作用：确保均衡负载，防止所有token都流向少数专家
+
+        # 判断是在训练模式下且alpha > 0才计算aux loss
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            # 将topk从[bsz*seq_len, top_k]的索引转换回[bsz, seq_len, top_k]的形式，以便后续计算
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+
+            # ---- 方式1: 序列级辅助损失（seq_aux=True) ----
+            if self.seq_aux:
+                # 恢复scores维度：
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                # 统计每个batch中每个专家被选中的次数：
+                # ce: [bsz, n_routed_experts]，记录每个专家被选中的次数
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
+
+                # scatter_add_: 根据topk_idx_for_aux_loss中的索引，将1累加到ce的对应位置上，统计每个专家被选中的次数
+                # 例如：如果topk_idx_for_aux_loss[0] = [1, 3]，则ce[0, 1]和ce[0, 3]都会加1，表示第0个batch中第1和第3个专家被选中了一次
+                ce.scatter_add_(
+                    dim=1,
+                    index=topk_idx_for_aux_loss,
+                    src=torch.ones_like(topk_idx_for_aux_loss, dtype=ce.dtype)
+                )
+
+                # 计算每个专家的平均使用率：
+                # ce/总的选择数，得到每个专家被选中的平均概率
+                # ce / L * K / E，其中L是序列长度，K是每个token选择的专家数，E是总的路由专家数
+                ce = ce.div(
+                    seq_len * aux_topk / self.n_routed_experts
+                )
+
+                # 计算aux loss：相对负载率 × 平均概率，求和后乘以 alpha
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1, keepdim=True)).sum(
+                    dim=1
+                ).mean() * self.alpha
+
+            # ---- 方式2: Batch级辅助损失（seq_aux=False）----
+            else:
+                # 将topk_idk 展平：[bsz, seq_len, top_k] -> [bsz*seq_len*top_k]
+                # 转换为one_hot编码， 得到[bsz*seq_len*top_k, n_routed_experts]，每行只有一个1，表示对应的专家被选中
+                # 举个例子：如果n_routed_experts=5，topk_idx_for_aux_loss 包含值0-4
+                # 那么one_hot编码会将这些值转化为对应位置为1，其余位置为0的向量。
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                
+                # ce表示整个batch中每个专家的平均选择率
+                # 比如[0.2, 0.5, 0.3]表示第一个专家被选中的平均概率是20%，第二个是50%，第三个是30% 
+                # fe = sum(mi,e) / [1/(N*K)]
+                ce = mask_ce.float().mean(dim=0)
+                # 乘以 E 把占比变回相对负载率：
+                fi = ce * self.n_routed_experts
+                # Pi = 1/N * Sum（Si，e）
+                # 表示整个batch中每个专家的平均分数
+                # scores 不恢复维度： [bsz * seq_len, n_routed_experts]
+                Pi = scores_for_aux.mean(dim=0)
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
+
+
+
+
+                
+
+
+
+
+
+
+
+
+
